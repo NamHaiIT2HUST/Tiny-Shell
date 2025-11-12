@@ -1,7 +1,9 @@
 # myShell - A Simple Windows Shell in C
 
 **Ngôn ngữ:** C
+
 **Nền tảng:** Windows
+
 **Môn học:** Nguyên lý Hệ điều hành
 
 ---
