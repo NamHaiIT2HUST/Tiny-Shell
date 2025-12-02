@@ -1,4 +1,4 @@
-# myShell - A Simple Windows Shell in C
+# myTinyShell - A Simple Windows Shell in C
 
 **Ngôn ngữ:** C
 
