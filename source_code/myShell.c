@@ -3,179 +3,298 @@
 #include <string.h>
 #include <windows.h>
 
-#define MAX_INPUT 256
-#define MAX_ARGS 10
+#define MAX_INPUT 1024
+#define MAX_ARGS 64
+#define MAX_PROCESSES 100
 
-//Thông tin tiến trình con
+// Màu sắc cho console
+#define COLOR_RESET   "\033[0m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_RED     "\033[31m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_BOLD    "\033[1m"
+
+// Thông tin tiến trình con
 typedef struct {
-    HANDLE hProcess;   //tham chiếu đến tiến trình con
-    DWORD pid;         //Số hiệu của tiến trình
-    char name[MAX_INPUT];             //tên lệnh or chương trình thực thi
-    char status[20];                    //Lưu trạng thái tiến trình
+    HANDLE hProcess;   // Handle tiến trình
+    HANDLE hThread;    // Handle luồng chính (Cần thiết để Pause/Resume)
+    DWORD pid;         // Process ID
+    char name[256];    // Tên lệnh
+    char status[20];   // Trạng thái: Running, Stopped, Terminated
+    int active;        // Đánh dấu slot này có đang dùng không
 } Process;
 
-Process process_list[100]; // Danh sách tiến trình con
-int process_count = 0;        //Đếm số chương trình con trong list
+Process process_list[MAX_PROCESSES];
+int process_count = 0;
 
+// Lấy đường dẫn hiện tại để in ra prompt ngầu hơn
 void display_prompt() {
-    printf("myShell> ");
+    char cwd[1024];
+    if (GetCurrentDirectory(sizeof(cwd), cwd)) {
+        printf(COLOR_CYAN "%s" COLOR_RESET " > ", cwd);
+    } else {
+        printf(COLOR_CYAN "myShell" COLOR_RESET " > ");
+    }
 }
 
-//Phân tích lệnh
+// Cập nhật danh sách: Kiểm tra xem tiến trình nào đã tự động kết thúc
+void refresh_process_list() {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_list[i].active) {
+            DWORD exitCode;
+            if (GetExitCodeProcess(process_list[i].hProcess, &exitCode)) {
+                if (exitCode != STILL_ACTIVE && strcmp(process_list[i].status, "Stopped") != 0) {
+                    // Tiến trình đã chết tự nhiên
+                    process_list[i].active = 0;
+                    CloseHandle(process_list[i].hProcess);
+                    CloseHandle(process_list[i].hThread);
+                }
+            }
+        }
+    }
+}
+
+// Phân tích lệnh (Hỗ trợ dấu ngoặc kép cho đường dẫn có khoảng trắng)
 int parse_command(char *input, char **args) {
     int argc = 0;
-    char *token = strtok(input, " \n");
-    while (token != NULL && argc < MAX_ARGS) {
-        args[argc++] = token;
-        token = strtok(NULL, " \n");
+    int in_quotes = 0;
+    char *start = input;
+    
+    for (char *p = input; *p; p++) {
+        if (*p == '"') {
+            in_quotes = !in_quotes;
+            if (!in_quotes) { *p = '\0'; args[argc++] = start + 1; start = p + 1; }
+            else { start = p; }
+        } else if (*p == ' ' && !in_quotes) {
+            *p = '\0';
+            if (p > start) args[argc++] = start;
+            start = p + 1;
+        }
     }
-    args[argc] = NULL; //Phần tử cuối là NULL vì CreateProcessA yêu cầu kết thúc là NULL
+    if (*start) args[argc++] = start;
+    args[argc] = NULL;
     return argc;
 }
 
-// Hàm kiểm tra xem có chạy background không (dấu &)
-int is_background(char **args, int argc) {
-    if (argc > 0 && strcmp(args[argc - 1], "&") == 0) {
-        args[argc - 1] = NULL; // Xóa dấu & khỏi danh sách tham số
+int is_background(char **args, int *argc) {
+    if (*argc > 0 && strcmp(args[*argc - 1], "&") == 0) {
+        args[*argc - 1] = NULL;
+        (*argc)--;
         return 1;
     }
     return 0;
 }
 
-//Thực hiện lệnh mà người dùng yêu cầu
-void execute_command(char **args, int background) {
-    //Xử lí các lệnh quản lí shell
-    if (strcmp(args[0], "exit") == 0) {
-        printf("Exiting myShell...\n");
-        exit(0);
-    } else if (strcmp(args[0], "list") == 0) {
-        printf("List of background processes:\n");
-        for (int i = 0; i < process_count; i++) {
-            printf("PID: %lu, Name: %s, Status: %s\n", process_list[i].pid, process_list[i].name, process_list[i].status);
+// --- CÁC LỆNH NỘI BỘ (BUILT-IN) ---
+
+void cmd_cd(char **args) {
+    if (args[1] == NULL) {
+        char cwd[1024];
+        GetCurrentDirectory(sizeof(cwd), cwd);
+        printf("Current Directory: %s\n", cwd);
+    } else {
+        if (!SetCurrentDirectory(args[1])) {
+            printf(COLOR_RED "Error: Cannot find path '%s'\n" COLOR_RESET, args[1]);
         }
-        return;
-    } else if (strcmp(args[0], "kill") == 0) {
-        if (args[1] == NULL) {
-            printf("Usage: kill <pid>\n");
-            return;
+    }
+}
+
+void cmd_list() {
+    refresh_process_list();
+    printf(COLOR_BOLD "\n%-10s %-20s %-15s\n" COLOR_RESET, "PID", "Name", "Status");
+    printf("--------------------------------------------------\n");
+    int count = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_list[i].active) {
+            char *color = COLOR_GREEN;
+            if (strcmp(process_list[i].status, "Stopped") == 0) color = COLOR_YELLOW;
+            
+            printf("%-10lu %-20s %s%s" COLOR_RESET "\n", 
+                   process_list[i].pid, process_list[i].name, color, process_list[i].status);
+            count++;
         }
-        DWORD pid = atoi(args[1]);
-        for (int i = 0; i < process_count; i++) {
-            if (process_list[i].pid == pid) {
-                TerminateProcess(process_list[i].hProcess, 1);
-                strcpy(process_list[i].status, "Terminated");
-                printf("Process %lu terminated\n", pid);
-                return;
+    }
+    if (count == 0) printf("No background processes running.\n");
+    printf("\n");
+}
+
+void cmd_kill(char **args) {
+    if (args[1] == NULL) { printf("Usage: kill <pid>\n"); return; }
+    DWORD pid = atoi(args[1]);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_list[i].active && process_list[i].pid == pid) {
+            if (TerminateProcess(process_list[i].hProcess, 1)) {
+                printf(COLOR_RED "Process %lu terminated.\n" COLOR_RESET, pid);
+                process_list[i].active = 0;
+                CloseHandle(process_list[i].hProcess);
+                CloseHandle(process_list[i].hThread);
+            } else {
+                printf(COLOR_RED "Failed to kill process.\n" COLOR_RESET);
             }
-        }
-        printf("Process %lu not found\n", pid);
-        return;
-    } else if (strcmp(args[0], "stop") == 0) {
-        if (args[1] == NULL) {
-            printf("Usage: stop <pid>\n");
             return;
         }
-        DWORD pid = atoi(args[1]);
-        for (int i = 0; i < process_count; i++) {
-            if (process_list[i].pid == pid) {
-                SuspendThread(process_list[i].hProcess);
+    }
+    printf("Process %lu not found.\n", pid);
+}
+
+void cmd_stop(char **args) {
+    if (args[1] == NULL) { printf("Usage: stop <pid>\n"); return; }
+    DWORD pid = atoi(args[1]);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_list[i].active && process_list[i].pid == pid) {
+            // SỬA QUAN TRỌNG: SuspendThread dùng hThread, không phải hProcess
+            if (SuspendThread(process_list[i].hThread) != (DWORD)-1) {
                 strcpy(process_list[i].status, "Stopped");
-                printf("Process %lu stopped\n", pid);
-                return;
+                printf(COLOR_YELLOW "Process %lu paused.\n" COLOR_RESET, pid);
+            } else {
+                printf("Error suspending process.\n");
             }
-        }
-        printf("Process %lu not found\n", pid);
-        return;
-    } else if (strcmp(args[0], "resume") == 0) {
-        if (args[1] == NULL) {
-            printf("Usage: resume <pid>\n");
             return;
         }
-        DWORD pid = atoi(args[1]);
-        for (int i = 0; i < process_count; i++) {
-            if (process_list[i].pid == pid) {
-                ResumeThread(process_list[i].hProcess);
+    }
+    printf("Process %lu not found.\n", pid);
+}
+
+void cmd_resume(char **args) {
+    if (args[1] == NULL) { printf("Usage: resume <pid>\n"); return; }
+    DWORD pid = atoi(args[1]);
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_list[i].active && process_list[i].pid == pid) {
+            if (ResumeThread(process_list[i].hThread) != (DWORD)-1) {
                 strcpy(process_list[i].status, "Running");
-                printf("Process %lu resumed\n", pid);
-                return;
+                printf(COLOR_GREEN "Process %lu resumed.\n" COLOR_RESET, pid);
+            } else {
+                printf("Error resuming process.\n");
             }
+            return;
         }
-        printf("Process %lu not found\n", pid);
-        return;
     }
+    printf("Process %lu not found.\n", pid);
+}
 
-//tạo lệnh
+void cmd_help() {
+    printf(COLOR_BOLD "\n--- HELP MENU ---\n" COLOR_RESET);
+    printf("1. command [args] [&] : Run program (add & for background)\n");
+    printf("2. cd <path>          : Change directory\n");
+    printf("3. list               : List background processes\n");
+    printf("4. kill <pid>         : Kill a process\n");
+    printf("5. stop <pid>         : Pause a process\n");
+    printf("6. resume <pid>       : Resume a process\n");
+    printf("7. cls                : Clear screen\n");
+    printf("8. exit               : Quit shell\n\n");
+}
+
+// --- THỰC THI CHƯƠNG TRÌNH NGOÀI ---
+
+void execute_external(char **args, int background) {
     char command_line[1024] = "";
+    
+    // Nối lại lệnh để chạy
     for (int i = 0; args[i] != NULL; i++) {
+        strcat(command_line, "\""); 
         strcat(command_line, args[i]);
-        strcat(command_line, " ");
+        strcat(command_line, "\" ");
     }
 
-//thành phần chạy tiến trình con
     STARTUPINFO si = { sizeof(STARTUPINFO) };
     PROCESS_INFORMATION pi;
 
-//Check file .bat
+    // Fix lỗi CMD cho file .bat hoặc lệnh nội bộ cmd
+    char final_cmd[1024];
     if (strstr(args[0], ".bat") != NULL) {
-        char bat_command[1024];
-        snprintf(bat_command, sizeof(bat_command), "cmd.exe /c %s", command_line);
-        strcpy(command_line, bat_command);
+        snprintf(final_cmd, sizeof(final_cmd), "cmd.exe /c %s", command_line);
+    } else {
+        strcpy(final_cmd, command_line);
     }
 
-//Tạo tiến trình con
-    BOOL success = CreateProcessA(NULL, command_line, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-    if (!success) {
-        printf("Failed to execute command: %lu\n", GetLastError());  //In ra màn hình báo lỗi nếu tạo tiến trình thất bại
+    if (!CreateProcessA(NULL, final_cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+        printf(COLOR_RED "Command not found or failed to execute.\n" COLOR_RESET);
         return;
     }
 
-//Lưu tiến trình con vào list
-    if (process_count < 100) {
-        process_list[process_count].hProcess = pi.hProcess;
-        process_list[process_count].pid = pi.dwProcessId;
-        strcpy(process_list[process_count].name, args[0]);
-        strcpy(process_list[process_count].status, "Running");
-        process_count++;
-    }
+    if (background) {
+        // Tìm slot trống để lưu process
+        int slot = -1;
+        for(int i=0; i<MAX_PROCESSES; i++) {
+            if(!process_list[i].active) {
+                slot = i;
+                break;
+            }
+        }
 
-//background không chạy thì chờ tiến trình con hoàn thành
-    if (!background) {
+        if (slot != -1) {
+            process_list[slot].hProcess = pi.hProcess;
+            process_list[slot].hThread = pi.hThread; // LƯU HANDLE THREAD
+            process_list[slot].pid = pi.dwProcessId;
+            strcpy(process_list[slot].name, args[0]);
+            strcpy(process_list[slot].status, "Running");
+            process_list[slot].active = 1;
+            printf(COLOR_GREEN "[+] Background process started. PID: %lu\n" COLOR_RESET, pi.dwProcessId);
+        } else {
+            printf(COLOR_RED "Process list full!\n" COLOR_RESET);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    } else {
+        // Chế độ foreground: chờ nó chạy xong
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-    } else {
-        printf("Child process %lu running in background\n", pi.dwProcessId);
     }
 }
 
 int main() {
+    // Kích hoạt chế độ ANSI color trên Windows 10/11 (nếu cần)
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD dwMode = 0;
+    GetConsoleMode(hOut, &dwMode);
+    dwMode |= 0x0004; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    SetConsoleMode(hOut, dwMode);
+
     char input[MAX_INPUT];
     char *args[MAX_ARGS];
     int background;
 
-    printf("WELCOME TO MY SHELL\n");
-    printf("The following commands:\n");
-    printf("list: List all background processes (ID, name, status)\n");
-    printf("kill <pid>: Terminate a process\n");
-    printf("stop <pid>: Stop a process\n");
-    printf("resume <pid>: Resume a process\n");
-    printf("exit: Exit my shell program\n");
+    // Xóa rác trong struct
+    memset(process_list, 0, sizeof(process_list));
+
+    printf(COLOR_BOLD "WELCOME TO MY SHELL v2.0\n" COLOR_RESET);
+    cmd_help();
 
     while (1) {
         display_prompt();
-        if (fgets(input, MAX_INPUT, stdin) == NULL) {
-            printf("\n");
-            continue;
+        if (fgets(input, MAX_INPUT, stdin) == NULL) break;
+
+        input[strcspn(input, "\n")] = 0;
+        if (strlen(input) == 0) continue;
+
+        int argc = parse_command(input, args);
+        if (argc == 0) continue;
+
+        background = is_background(args, &argc);
+
+        // Xử lý lệnh
+        if (strcmp(args[0], "exit") == 0) {
+            printf("Goodbye!\n");
+            break;
+        } else if (strcmp(args[0], "help") == 0) {
+            cmd_help();
+        } else if (strcmp(args[0], "cls") == 0) {
+            system("cls");
+        } else if (strcmp(args[0], "cd") == 0) {
+            cmd_cd(args);
+        } else if (strcmp(args[0], "list") == 0) {
+            cmd_list();
+        } else if (strcmp(args[0], "kill") == 0) {
+            cmd_kill(args);
+        } else if (strcmp(args[0], "stop") == 0) {
+            cmd_stop(args);
+        } else if (strcmp(args[0], "resume") == 0) {
+            cmd_resume(args);
+        } else {
+            execute_external(args, background);
         }
-
-        input[strcspn(input, "\n")] = 0;               //Xóa lý tự ở cuối
-
-        int argc = parse_command(input, args);       //check lệnh
-        if (argc == 0) continue; //Không có lệnh
-
-        background = is_background(args, argc);     //check background
-
-        execute_command(args, background);         //Chạy lệnh yêu cầu
     }
     return 0;
 }
